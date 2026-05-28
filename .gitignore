@@ -1,0 +1,31 @@
+# Go 构建产物
+bin/
+dist/
+*.exe
+*.test
+*.out
+coverage.out
+configs/config.yaml
+
+# 本地环境配置
+.env
+.env.local
+.config.yaml
+
+
+# 本地 Go 缓存
+.gocache/
+.gomodcache/
+
+# 日志文件
+logs/
+*.log
+
+# IDE 与系统文件
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# 临时文件
+tmp/
