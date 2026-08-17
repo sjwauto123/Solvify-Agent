@@ -1,0 +1,7 @@
+# IDE files (GoLand / IntelliJ)
+.idea/
+*.iml
+
+# OS / editor
+.DS_Store
+Thumbs.db
