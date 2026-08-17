@@ -1,4 +1,4 @@
-import { ref, computed, nextTick, inject } from 'vue'
+import { ref, computed, nextTick, inject, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { marked } from 'marked'
@@ -6,17 +6,19 @@ import * as chatApi from '@/api/chat'
 import * as modelApi from '@/api/model'
 import * as authApi from '@/api/auth'
 import { request } from '@/api/client'
-import type { ChatSession } from '@/types/chat'
+import type { ChatSession, FeedbackRequest, PendingApproval } from '@/types/chat'
 import type { StreamEvent } from '@/types/chat'
 
-// ── Local types for UI display ──
+// ── UI 展示用的本地类型 ──
 
+// 推理时间线步骤
 interface TimelineStep {
   title: string
   detail?: string
   status: string
 }
 
+// 聊天消息展示结构
 interface DisplayMessage {
   id: string
   role: 'user' | 'assistant' | 'error'
@@ -25,51 +27,62 @@ interface DisplayMessage {
   retryable?: boolean
   sources?: StreamEvent['sources']
   timeline?: TimelineStep[]
+  trace_id?: string
+  feedback_rating?: 1 | -1
+  feedback_reasons?: string[]
+  feedback_comment?: string
 }
 
+// 模型选项
 interface ModelOption {
   id: string
   name: string
   modelType: 'system' | 'user'
 }
 
+// 知识库选项
 interface KnowledgeBaseOption {
   id: string
   name: string
   document_count?: number
 }
 
-// ── Tooltip content store (avoids HTML attribute escaping issues) ──
+// ── Tooltip 内容存储（避免 HTML 属性转义问题） ──
 
 const tooltipStore = new Map<string, string>()
 
+// 获取指定 key 的 tooltip 内容
 export function getTooltipContent(key: string): string {
   return tooltipStore.get(key) ?? ''
 }
 
 let _tooltipSeq = 0
+// 生成下一个 tooltip key
 export function nextTipKey(): string {
   return `tip_${_tooltipSeq++}`
 }
 
+// 设置 tooltip 内容
 export function setTooltip(key: string, value: string): void {
   tooltipStore.set(key, value)
 }
 
+// 清理标题中的换行
 export function cleanTitle(text: string): string {
   if (!text) return ''
   return text.replace(/[\r\n]+/g, ' ').trim()
 }
 
+// 聊天组合式函数
 export function useChat() {
   const router = useRouter()
   const refreshHistory = inject<() => Promise<void>>('refreshHistory')
 
-  // ── Session ──
+  // ── 会话状态 ──
   const sessions = ref<ChatSession[]>([])
   const activeSessionId = ref<string | null>(null)
 
-  // ── Messages ──
+  // ── 消息状态 ──
   const messages = ref<DisplayMessage[]>([])
   const collapsedTimelines = ref<Set<number>>(new Set())
   const isLoading = ref(false)
@@ -78,21 +91,26 @@ export function useChat() {
   const streamTimeline = ref<TimelineStep[]>([])
   const progressText = ref('')
 
-  // ── Selectors ──
+  // ── 选择器 ──
   const modelOptions = ref<ModelOption[]>([])
   const knowledgeBases = ref<KnowledgeBaseOption[]>([])
   const connected = ref(false)
 
-  // ── Input ──
+  // ── 输入状态 ──
   const input = ref('')
   const selectedModel = ref('')
   const selectedKBs = ref<string[]>([])
   const searchMode = ref<'quick' | 'smart-reasoning'>('quick')
 
-  // ── Abort control ──
+  // ── 中断控制 ──
   let abortController: AbortController | null = null
 
-  // ── Computed ──
+  // ── 审批/澄清状态（统一处理 interrupt） ──
+  const pendingApproval = ref<PendingApproval | null>(null)
+  // interrupt 事件所在的 assistant 消息块 ID，恢复流程复用同一个
+  let interruptedAssistantId = ''
+
+  // ── 计算属性 ──
   const activeSession = computed(() =>
     sessions.value.find((s) => s.id === activeSessionId.value),
   )
@@ -104,7 +122,7 @@ export function useChat() {
       .join(', ')
   })
 
-  // ── Init ──
+  // ── 初始化 ──
   async function init() {
     try {
       const [modelsRes, userModelsRes, kbRes, profileRes] = await Promise.all([
@@ -131,9 +149,9 @@ export function useChat() {
       }
       modelOptions.value = opts
 
-      // 使用用户上次选择的模型
-      if (profileRes?.code === 0 && profileRes.data?.lastModel) {
-        selectedModel.value = profileRes.data.lastModel
+      // 使用用户上次选择的模型（lastModel 嵌套在 user 对象里）
+      if (profileRes?.code === 0 && profileRes.data?.user?.lastModel) {
+        selectedModel.value = profileRes.data.user.lastModel
       } else if (opts.length > 0) {
         selectedModel.value = opts[0].id
       }
@@ -154,7 +172,8 @@ export function useChat() {
     }
   }
 
-  // ── Sessions ──
+  // ── 会话操作 ──
+  // 加载会话列表
   async function loadSessions() {
     try {
       const res = await chatApi.listSessions()
@@ -162,6 +181,7 @@ export function useChat() {
     } catch { /* silent */ }
   }
 
+  // 创建新会话
   async function createSession(title: string): Promise<string | null> {
     try {
       const res = await chatApi.createSession({
@@ -177,6 +197,7 @@ export function useChat() {
     return null
   }
 
+  // 加载指定会话的消息列表
   async function loadMessages(sessionId: string) {
     try {
       const res = await chatApi.getMessages(sessionId)
@@ -219,13 +240,36 @@ export function useChat() {
     }
   }
 
+  // 选中指定会话并加载消息
   function selectSession(sessionId: string) {
     activeSessionId.value = sessionId
     loadMessages(sessionId)
   }
 
-  // ── Send Message (SSE streaming) ──
-  async function sendMessage() {
+  // 切换会话时恢复/清除审批卡或澄清追问卡状态
+  watch(
+    () => activeSession.value,
+    (sess) => {
+      const pc = sess?.pending_checkpoint
+      if (pc && pc.checkpoint_id) {
+        pendingApproval.value = {
+          checkpoint_id: pc.checkpoint_id,
+          interrupt_id: pc.interrupt_id,
+          title: pc.is_clarify ? '需要澄清' : '需要人工确认',
+          detail: pc.question ?? '执行被中断',
+          tool_name: pc.tool_name,
+          options: pc.options,
+          is_clarify: pc.is_clarify ?? false,
+        }
+      } else {
+        pendingApproval.value = null
+      }
+    },
+    { immediate: true },
+  )
+
+  // ── 发送消息（SSE 流式） ──
+  async function sendMessage(displayText?: string, isResume = false) {
     const content = input.value.trim()
     if (!content || isLoading.value) return
 
@@ -234,21 +278,29 @@ export function useChat() {
       return
     }
 
-    // 延迟清空输入框，避免跳转后问题丢失
-    // 如果是新会话，等会话创建成功后再清空
     const isNewSession = !activeSessionId.value
-    if (!isNewSession) {
-      // 已有会话，立即清空
+
+    if (isResume) {
+      // 恢复流程：不 push 用户气泡，审批内容不是新的提问
       input.value = ''
+    } else {
+      const display = displayText ?? content
+
+      // 延迟清空输入框，避免跳转后问题丢失
+      if (!isNewSession) {
+        // 已有会话，立即清空
+        input.value = ''
+      }
+
+      messages.value.push({ id: 'u-' + Date.now(), role: 'user', content: display })
     }
 
-    messages.value.push({ id: 'u-' + Date.now(), role: 'user', content })
     isLoading.value = true
     progressText.value = ''
     streamContent.value = ''
     streamTimeline.value = []
 
-    // Auto-create session
+    // 自动创建会话
     if (isNewSession) {
       const id = await createSession(content)
       if (!id) {
@@ -291,15 +343,17 @@ export function useChat() {
 
     try {
       const reader = await chatApi.sendMessage(activeSessionId.value, {
-        content,
-        model_id: selectedModel.value,
-        model_type: modelOpt?.modelType ?? 'system',
-        search_mode: searchMode.value,
-        knowledge_base_ids: selectedKBs.value.length ? selectedKBs.value : knowledgeBases.value.map(k => k.id),
-      }, abortController.signal)
+      content,
+      model_id: selectedModel.value,
+      model_type: modelOpt?.modelType ?? 'system',
+      search_mode: searchMode.value,
+      knowledge_base_ids: selectedKBs.value.length ? selectedKBs.value : knowledgeBases.value.map(k => k.id),
+    }, abortController.signal)
 
-      const decoder = new TextDecoder()
-      let buffer = ''
+    const traceId = reader._meta?.trace_id
+
+    const decoder = new TextDecoder()
+    let buffer = ''
 
       while (true) {
         const { done, value } = await reader.read()
@@ -317,7 +371,13 @@ export function useChat() {
 
             switch (evt.type) {
               case 'start':
-                if (evt.message_id) assistantId = evt.message_id
+                // 恢复流程：复用 interrupt 时的 assistant 块 ID，保持在同一块里
+                if (interruptedAssistantId) {
+                  assistantId = interruptedAssistantId
+                  interruptedAssistantId = ''
+                } else if (evt.message_id) {
+                  assistantId = evt.message_id
+                }
                 if (evt.sources) finalSources = evt.sources
                 break
 
@@ -329,7 +389,7 @@ export function useChat() {
               case 'tool_call':
               case 'tool_result':
               case 'warning':
-                // Mark all running steps as success before adding new one
+                // 添加新步骤前，将所有运行中的步骤标记为成功
                 streamTimeline.value.forEach(
                   (s) => s.status === 'running' && (s.status = 'success'),
                 )
@@ -396,6 +456,45 @@ export function useChat() {
                 })
                 return
 
+              case 'interrupt': {
+                isLoading.value = false
+                progressText.value = ''
+                streamContent.value = ''
+                streamSources.value = []
+                interruptedAssistantId = assistantId || 'a-' + Date.now()
+
+                if (evt.status === 'clarify' || evt.clarify) {
+                  // 澄清追问
+                  const approval: PendingApproval = {
+                    checkpoint_id: evt.checkpoint_id ?? '',
+                    interrupt_id: evt.interrupt_id ?? '',
+                    title: '需要澄清',
+                    detail: evt.clarify?.question ?? evt.detail ?? '',
+                    tool_name: '',
+                    target_ref: '',
+                    reason: evt.clarify?.context ?? '',
+                    options: evt.clarify?.options ?? [],
+                    is_clarify: true,
+                  }
+                  pendingApproval.value = approval
+                } else {
+                  // 危险工具审批
+                  const info = evt.interrupt_info ?? {}
+                  const approval: PendingApproval = {
+                    checkpoint_id: evt.checkpoint_id ?? '',
+                    interrupt_id: evt.interrupt_id ?? '',
+                    title: '需要人工确认',
+                    detail: evt.detail ?? (info?.message as string) ?? '执行被中断，等待用户处理',
+                    tool_name: (info?.tool_name as string) ?? '',
+                    target_ref: (info?.target_ref as string) ?? '',
+                    reason: (info?.reason as string) ?? '',
+                    is_clarify: false,
+                  }
+                  pendingApproval.value = approval
+                }
+                return
+              }
+
               case 'done':
                 streamTimeline.value.forEach(
                   (s) => s.status === 'running' && (s.status = 'success'),
@@ -404,18 +503,31 @@ export function useChat() {
                   finalSources = evt.sources
                   streamSources.value = evt.sources
                 }
-                messages.value.push({
-                  id: assistantId || 'a-' + Date.now(),
-                  role: 'assistant',
-                  content: finalContent,
-                  sources: finalSources,
-                  timeline:
-                    streamTimeline.value.length > 0
-                      ? [...streamTimeline.value]
-                      : undefined,
-                })
-                if (streamTimeline.value.length > 0) {
-                  collapsedTimelines.value.add(messages.value.length - 1)
+                const doneTimeline = streamTimeline.value.length > 0 ? [...streamTimeline.value] : undefined
+                const finalAssistantId = assistantId || 'a-' + Date.now()
+                // 恢复流程：assistantId 已存在（interrupt 时 push 过），更新那条而不是新建
+                const existingIdx = messages.value.findIndex((m) => m.id === finalAssistantId)
+                if (existingIdx >= 0) {
+                  const updated = [...messages.value]
+                  updated[existingIdx] = {
+                    ...updated[existingIdx],
+                    content: finalContent,
+                    sources: finalSources.length > 0 ? finalSources : updated[existingIdx].sources,
+                    timeline: doneTimeline ?? updated[existingIdx].timeline,
+                    trace_id: traceId,
+                  }
+                  messages.value = updated
+                  if (doneTimeline) collapsedTimelines.value.add(existingIdx)
+                } else {
+                  messages.value.push({
+                    id: finalAssistantId,
+                    role: 'assistant',
+                    content: finalContent,
+                    sources: finalSources,
+                    timeline: doneTimeline,
+                    trace_id: traceId,
+                  })
+                  if (doneTimeline) collapsedTimelines.value.add(messages.value.length - 1)
                 }
                 isLoading.value = false
                 streamContent.value = ''
@@ -424,13 +536,13 @@ export function useChat() {
                 progressText.value = ''
                 return
             }
-          } catch { /* skip bad JSON */ }
+          } catch { /* 跳过非法 JSON */ }
         }
       }
     } catch (e: unknown) {
       const isAbort = e instanceof DOMException && e.name === 'AbortError'
       if (isAbort) {
-        // User aborted — save partial content / reasoning steps / sources if any
+        // 用户中断——保存已有的部分内容 / 推理步骤 / 来源
         if (finalContent || streamContent.value || streamTimeline.value.length || streamSources.value?.length) {
           messages.value.push({
             id: assistantId || 'a-' + Date.now(),
@@ -438,6 +550,7 @@ export function useChat() {
             content: streamContent.value || finalContent,
             sources: finalSources.length ? finalSources : (streamSources.value?.length ? [...streamSources.value] : undefined),
             timeline: streamTimeline.value.length ? [...streamTimeline.value] : undefined,
+            trace_id: traceId,
           })
         }
       } else {
@@ -460,25 +573,29 @@ export function useChat() {
     }
   }
 
-  // ── Helpers ──
+  // ── 辅助方法 ──
+  // 滚动到底部
   function scrollToBottom(el: HTMLElement | null) {
     nextTick(() => {
       if (el) el.scrollTop = el.scrollHeight
     })
   }
 
+  // 切换知识库选中状态
   function toggleKB(id: string) {
     const idx = selectedKBs.value.indexOf(id)
     if (idx >= 0) selectedKBs.value.splice(idx, 1)
     else selectedKBs.value.push(id)
   }
 
+  // 复制文本到剪贴板
   function copyText(text: string) {
     navigator.clipboard.writeText(text)
       .then(() => ElMessage.success('已复制'))
       .catch(() => ElMessage.error('复制失败'))
   }
 
+  // 重新生成最后一条回复
   function regenerate() {
     const lastIdx = messages.value.length - 1
     if (lastIdx >= 0 && messages.value[lastIdx].role === 'assistant') {
@@ -498,6 +615,7 @@ export function useChat() {
     }
   }
 
+  // 重试最后一条错误消息
   function retryLastMessage() {
     // 找到最后一条错误消息
     const lastErrorIdx = [...messages.value]
@@ -528,13 +646,53 @@ export function useChat() {
     }
   }
 
+  // 中止当前生成
   function stopGeneration() {
     if (abortController) {
       abortController.abort()
     }
   }
 
-  // ── Content formatting ──
+  // ── 审批 / 澄清追问统一入口 ──
+  function approvePending(resolution: string) {
+    if (!pendingApproval.value) return
+    input.value = resolution
+    pendingApproval.value = null
+    void sendMessage(undefined, true)
+  }
+
+  function cancelApproval() {
+    pendingApproval.value = null
+    interruptedAssistantId = ''
+  }
+
+  // ── 反馈 ──
+  // 提交消息反馈
+  async function submitFeedback(
+    messageId: string,
+    req: FeedbackRequest,
+  ): Promise<void> {
+    const idx = messages.value.findIndex((m) => m.id === messageId)
+    if (idx < 0) return
+    const target = messages.value[idx]
+    try {
+      await chatApi.submitFeedback(messageId, req)
+      const next = [...messages.value]
+      next[idx] = {
+        ...target,
+        feedback_rating: req.rating,
+        feedback_reasons: req.reasons ?? [],
+        feedback_comment: req.comment,
+      }
+      messages.value = next
+      ElMessage.success(req.rating === 1 ? '感谢您的反馈' : '感谢反馈，我们会持续优化')
+    } catch (e: unknown) {
+      ElMessage.error(e instanceof Error ? e.message : '提交反馈失败')
+    }
+  }
+
+  // ── 内容格式化 ──
+  // 格式化消息内容，处理引用标签
   function formatContent(content: string, _sources?: unknown[]): string {
     if (!content) return ''
 
@@ -599,10 +757,11 @@ export function useChat() {
     return html
   }
 
+  // 清理 tooltip 文本中的元数据标签
   function cleanTooltipText(text: string): string {
     if (!text) return ''
-    // Only remove actual metadata tags; do NOT globally strip `title=` / `doc=`
-    // because normal article text may legitimately contain those substrings.
+    // 仅移除实际的元数据标签，不要全局清除 `title=` / `doc=`
+    // 因为正常文章文本中可能合法包含这些子串
     return text
       .replace(/<kb(?:\s[^>]*)?\s*\/?>\s*/gi, '')
       .replace(/<web(?:\s[^>]*)?\s*\/?>\s*/gi, '')
@@ -613,7 +772,7 @@ export function useChat() {
       .trim()
   }
 
-  // Get comma-separated chunk IDs for a source document tooltip
+  // 获取来源文档 tooltip 所需的逗号分隔 chunk ID
   function getSourceChunkIds(source: any): string {
     if (!source) return ''
     const chunks = source.chunks
@@ -624,7 +783,7 @@ export function useChat() {
       .join(',')
   }
 
-  // Extract web sources from content (for displaying web search links)
+  // 从内容中提取网页来源（用于展示联网搜索链接）
   function extractWebSources(content: string): { url: string; title: string }[] {
     const result: { url: string; title: string }[] = []
     const seen = new Set<string>()
@@ -639,6 +798,7 @@ export function useChat() {
     return result
   }
 
+  // 重置聊天状态，开始新会话
   function newChat() {
     activeSessionId.value = null
     messages.value = []
@@ -682,19 +842,25 @@ export function useChat() {
     regenerate,
     retryLastMessage,
     stopGeneration,
+    submitFeedback,
     newChat,
     cleanTooltipText,
+    pendingApproval,
+    approvePending,
+    cancelApproval,
   }
 }
 
-// ── Utilities ──
+// ── 工具函数 ──
 
+// HTML 转义
 function escapeHtml(s: string): string {
   const d = document.createElement('div')
   d.textContent = s
   return d.innerHTML
 }
 
+// HTML 属性转义
 function escapeAttr(s: string): string {
   return s
     .replace(/&/g, '&amp;')
@@ -704,7 +870,8 @@ function escapeAttr(s: string): string {
     .replace(/\n/g, '&#10;')
 }
 
+// 数字转圆圈数字符号
 function toCircleNum(n: number): string {
-  const c = '①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳'
+  const c = '①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑯⑰⑱⑲⑳'
   return n >= 1 && n <= 20 ? c[n - 1] : `[${n}]`
 }

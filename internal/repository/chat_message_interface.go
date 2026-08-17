@@ -20,11 +20,20 @@ type ChatMessageSearchRow struct {
 // ChatMessageRepo 定义聊天消息数据访问接口
 type ChatMessageRepo interface {
 	Create(ctx context.Context, message *entity.ChatMessage) error
+	FindByID(ctx context.Context, id string) (*entity.ChatMessage, error)
 	FindBySessionID(ctx context.Context, sessionID string) ([]entity.ChatMessage, error)
+	// FindBySessionIDForContext 摘要/记忆抽取场景专用：全量消息但只取 5 个必要字段，sources/metadata 不传
+	FindBySessionIDForContext(ctx context.Context, sessionID string) ([]entity.ChatMessage, error)
 	FindRecent(ctx context.Context, sessionID string, limit int) ([]entity.ChatMessage, error)
+	// FindRecentForContext 上下文构建专用：只取构建 Prompt 需要的 5 个字段，避免 sources/metadata 大字段浪费 IO
+	FindRecentForContext(ctx context.Context, sessionID string, limit int) ([]entity.ChatMessage, error)
 	DeleteBySessionID(ctx context.Context, sessionID string) error
 	// SearchByKeyword 按关键字搜索用户历史消息
 	SearchByKeyword(ctx context.Context, userID, query string, topK int) ([]ChatMessageSearchRow, error)
-	// SearchRecentByKeywords 在指定会话中按关键词检索最近消息
+	// SearchRecentByKeywords 在指定会话中按关键词检索最近消息（ILIKE 兜底路径）
 	SearchRecentByKeywords(ctx context.Context, sessionID string, keywords []string, limit int) ([]entity.ChatMessage, error)
+	// SearchRecentByVector 在指定会话中按向量语义检索最近消息（pgvector 余弦距离）
+	SearchRecentByVector(ctx context.Context, sessionID string, queryEmbedding []float32, limit int, distanceThreshold float64) ([]entity.ChatMessage, error)
+	// UpdateEmbedding 更新指定消息的向量表示（后台写入路径，失败不影响主流程）
+	UpdateEmbedding(ctx context.Context, messageID string, embedding entity.FloatVector) error
 }

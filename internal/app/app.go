@@ -8,12 +8,16 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
+	einoTool "github.com/cloudwego/eino/components/tool"
 	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
+	"golang.org/x/sync/singleflight"
 	"gorm.io/gorm"
 
 	"solvify-agent/internal/agent"
@@ -21,6 +25,7 @@ import (
 	"solvify-agent/internal/integration/dingtalk"
 	"solvify-agent/internal/llm"
 	"solvify-agent/internal/middleware"
+	"solvify-agent/internal/observability"
 	"solvify-agent/internal/rag"
 	"solvify-agent/internal/repository"
 	"solvify-agent/internal/service"
@@ -38,8 +43,13 @@ type App struct {
 	cfg          *config.Config
 	postgresqlDB *gorm.DB
 	redis        *redis.Client
+	obsRecorder  observability.Recorder
 	router       *api.Router
 	server       *http.Server
+
+	// 阶段 1.4：OTel / Prometheus 资源，由 App 负责生命周期管理
+	tracerShutdown func(context.Context) error
+	promRegistry   *prometheus.Registry
 }
 
 // NewApp 创建应用实例
@@ -58,7 +68,6 @@ func (a *App) Initialize() error {
 	if err := a.initDatabase(); err != nil {
 		return err
 	}
-
 	a.initDependencies()
 	a.initRouter()
 	a.initServer()
@@ -114,33 +123,36 @@ func (a *App) initLogger() error {
 
 // initDatabase 初始化 PostgresSQL 和 Redis 连接
 func (a *App) initDatabase() error {
-	// postgresql
+	// PostgreSQL 数据库连接
 	postgresqlDB, err := database.OpenPostgreSQL(&a.cfg.Database.Postgres)
 	if err != nil {
 		return fmt.Errorf("初始化 PostgreSQL 失败: %w", err)
 	}
 	a.postgresqlDB = postgresqlDB
-	//自动迁移数据库表结构
-	//if err := postgresqlDB.AutoMigrate(
-	//	&entity.User{},
-	//	&entity.Model{},
-	//	&entity.UserModelConfig{},
-	//	&entity.KnowledgeBase{},
-	//	&entity.StorageQuota{},
-	//	&entity.Document{},
-	//	&entity.DocumentProcessingJob{},
-	//	&entity.DocumentVersion{},
-	//	&entity.DocumentChunk{},
-	//	&entity.ChatSession{},
-	//	&entity.ChatMessage{},
-	//	&entity.ToolType{},
-	//	&entity.ToolProvider{},
-	//	&entity.UserToolConfig{},
-	//); err != nil {
-	//	return fmt.Errorf("数据库自动迁移失败: %w", err)
-	//}
 
-	// redis
+	// pgvector 索引健康检查（仅在 enable_pgvector 时执行）
+	if a.cfg.Database.Postgres.EnablePGVector {
+		if err := database.EnsurePGVectorIndex(postgresqlDB); err != nil {
+			logger.Warnf("pgvector 索引检查异常（不阻塞启动）: %v", err)
+		}
+	}
+
+	// keywords GIN 索引健康检查（关键词检索核心加速，不依赖 pgvector 开关）
+	if err := database.EnsureKeywordsGINIndex(postgresqlDB); err != nil {
+		logger.Warnf("keywords GIN 索引检查异常（不阻塞启动）: %v", err)
+	}
+
+	// 上下文加载链路高频索引（chat_messages / chat_sessions / user_memories）
+	if err := database.EnsureContextIndexes(postgresqlDB); err != nil {
+		logger.Warnf("上下文索引检查异常（不阻塞启动）: %v", err)
+	}
+
+	// message_feedback 表 schema 补齐（早期 AutoMigrate 建表后 entity 新增列，AutoMigrate 不会 ADD COLUMN）
+	if err := database.EnsureMessageFeedbackSchema(postgresqlDB); err != nil {
+		logger.Warnf("message_feedback schema 补齐异常（不阻塞启动）: %v", err)
+	}
+
+	// Redis 缓存连接
 	redisClient, err := database.OpenRedis(&a.cfg.Database.Redis)
 	if err != nil {
 		_ = database.ClosePostgreSQL(a.postgresqlDB)
@@ -158,7 +170,19 @@ func (a *App) ensureStorageQuotaUniqueIndex(db *gorm.DB) error {
 	return nil
 }
 
-// initEmbedding 初始化 Embedding 客户端，返回带缓存的向量化函数
+const (
+	embeddingInMemCacheSize = 2048
+	embeddingRedisTTL       = 24 * time.Hour
+)
+
+// initEmbedding 初始化 Embedding 客户端，返回带两级缓存 + singleflight 去重的向量化函数
+//
+// 缓存层级：
+//  1. 进程内 sync.Map fast-path（零网络 IO，容量 embeddingInMemCacheSize，LRU 清理）
+//  2. Redis 共享缓存（跨进程，24h TTL）
+//  3. Embedding API 调用
+//
+// singleflight 防止并发击穿：同一 key 的并发请求只打一次 API。
 func (a *App) initEmbedding() rag.EmbeddingFunc {
 
 	embeddingClient, err := llm.NewEmbeddingClientFromConfig(context.Background(), &a.cfg.Embedding)
@@ -166,30 +190,84 @@ func (a *App) initEmbedding() rag.EmbeddingFunc {
 		logger.Fatal("初始化 Embedding 客户端失败", zap.Error(err))
 	}
 
-	// Embedding 缓存（相同文本 → 相同向量，缓存 24 小时）
-	embeddingCache := cache.New(a.redis, "emb:", 24*time.Hour)
+	redisCache := cache.New(a.redis, "emb:", embeddingRedisTTL)
+	var inMem sync.Map // map[string][]float64
+	var sf singleflight.Group
+	var inMemMu sync.Mutex
+	inMemCount := 0
 
 	return func(ctx context.Context, text string) ([]float64, error) {
 		cacheKey := fmt.Sprintf("%x", sha256.Sum256([]byte(text)))
-		var vec []float64
-		if found, _ := embeddingCache.Get(ctx, cacheKey, &vec); found {
-			logger.Infof("[Embedding] 缓存命中: key=%s text=%q dim=%d", cacheKey[:8], text, len(vec))
+
+		// 层级 1：进程内 fast-path
+		if v, ok := inMem.Load(cacheKey); ok {
+			logger.Debugf("[Embedding] 内存缓存命中: key=%s", cacheKey[:8])
+			return v.([]float64), nil
+		}
+
+		// singleflight 包裹：并发只调一次
+		ch := sf.DoChan(cacheKey, func() (interface{}, error) {
+			// 层级 2：Redis
+			var vec []float64
+			if found, _ := redisCache.Get(ctx, cacheKey, &vec); found {
+				logger.Infof("[Embedding] Redis 缓存命中: key=%s dim=%d", cacheKey[:8], len(vec))
+				inMem.Store(cacheKey, vec)
+				return vec, nil
+			}
+
+			// 层级 3：调 API
+			logger.Infof("[Embedding] 全缓存未命中: key=%s text=%q, 调用 API...", cacheKey[:8], truncateText(text, 60))
+			vec, err := embeddingClient.Embed(ctx, text)
+			if err != nil {
+				logger.Errorf("[Embedding] API 调用失败: %v", err)
+				return nil, err
+			}
+
+			if err := redisCache.Set(ctx, cacheKey, vec, 0); err != nil {
+				logger.Warnf("[Embedding] Redis 缓存写入失败: %v", err)
+			}
+			inMem.Store(cacheKey, vec)
+
+			// 简单容量管控：超阈值时删除约 20% 条目
+			inMemMu.Lock()
+			inMemCount++
+			if inMemCount > embeddingInMemCacheSize {
+				cleaned := 0
+				inMem.Range(func(key, _ any) bool {
+					if cleaned >= embeddingInMemCacheSize/5 {
+						return false
+					}
+					inMem.Delete(key)
+					cleaned++
+					return true
+				})
+				inMemCount -= cleaned
+				logger.Infof("[Embedding] 内存缓存清理: 删除 %d 条, 剩余约 %d", cleaned, inMemCount)
+			}
+			inMemMu.Unlock()
+
+			logger.Infof("[Embedding] API 返回: dim=%d, 已写两级缓存", len(vec))
 			return vec, nil
+		})
+
+		select {
+		case res := <-ch:
+			if res.Err != nil {
+				return nil, res.Err
+			}
+			return res.Val.([]float64), nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		}
-		logger.Infof("[Embedding] 缓存未命中: key=%s text=%q, 调用 API...", cacheKey[:8], text)
-		vec, err := embeddingClient.Embed(ctx, text)
-		if err != nil {
-			logger.Errorf("[Embedding] API 调用失败: %v", err)
-			return nil, err
-		}
-		logger.Infof("[Embedding] API 返回: dim=%d", len(vec))
-		if err := embeddingCache.Set(ctx, cacheKey, vec, 0); err != nil {
-			logger.Warnf("[Embedding] 缓存写入失败: %v", err)
-		} else {
-			logger.Infof("[Embedding] 已写入缓存: key=%s", cacheKey[:8])
-		}
-		return vec, nil
 	}
+}
+
+func truncateText(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "..."
 }
 
 // initRetriever 初始化 RAG 检索器（混合检索 + 可选装饰器链）
@@ -226,47 +304,47 @@ type AgentComponents struct {
 	AgentEngine *agent.Engine
 }
 
-// initAgentComponents 初始化 Agent 相关组件（Embedding、RAG、工具、Agent 引擎）
-func (a *App) initAgentComponents(toolFactory tool.ToolFactory, documentRepo repository.DocumentRepository, chunkRepo repository.ChunkRepository, kbRepo repository.KnowledgeBaseRepository) *AgentComponents {
+// initAgentComponents 初始化 Agent 相关组件（Embedding、RAG、工具注册、Agent 引擎）
+// 内置工具全部通过 RegisterInternal 注册，Engine 不感知具体工具类型，新增内置工具只需要在这里多调一行
+func (a *App) initAgentComponents(toolFactory tool.ToolFactory, documentRepo repository.DocumentRepository, chunkRepo repository.DocumentChunkRepository, kbRepo repository.KnowledgeBaseRepository) *AgentComponents {
 	embeddingFunc := a.initEmbedding()
 	vectorRetriever := a.initRetriever(embeddingFunc)
 
-	// knowledge_search 工厂：每次 Agent 请求创建带用户上下文的工具实例
-	ksFactory := agent.KnowledgeSearchFactory(func(userID string, kbIDs []string) *tool.KnowledgeSearchTool {
-		return tool.NewKnowledgeSearchTool(vectorRetriever).WithContext(userID, kbIDs)
-	})
+	// ── 初始化 Agent Engine ──
+	agentEngine := agent.NewEngine(toolFactory, a.cfg.Agent)
+	if a.obsRecorder != nil {
+		agentEngine.WithObservability(a.obsRecorder)
+	}
 
-	// grep_chunks 工厂：关键词精确匹配
-	grepFactory := agent.GrepChunksFactory(func(userID string, kbIDs []string) *tool.GrepChunksTool {
-		return tool.NewGrepChunksTool(chunkRepo).WithContext(userID, kbIDs)
-	})
-
-	// get_document_info 工厂：文档元数据
-	docInfoFactory := agent.GetDocumentInfoFactory(func(userID string) *tool.GetDocumentInfoTool {
-		return tool.NewGetDocumentInfoTool(documentRepo).WithContext(userID)
-	})
-
-	// list_knowledge_chunks 工厂：文档列表
-	listChunksFactory := agent.ListKnowledgeChunksFactory(func(userID string, kbIDs []string) *tool.ListKnowledgeChunksTool {
-		return tool.NewListKnowledgeChunksTool(documentRepo).WithContext(userID, kbIDs)
-	})
-
-	// list_knowledge_bases 工厂：知识库列表
-	listBasesFactory := agent.ListKnowledgeBasesFactory(func(userID string) *tool.ListKnowledgeBasesTool {
-		return tool.NewListKnowledgeBasesTool(kbRepo).WithContext(userID)
-	})
-
-	// 初始化 Agent Engine（eino ReAct Agent）
-	// 用户配置的工具（web_search 等）通过 ToolFactory 从 DB/Redis 动态加载
-	agentEngine := agent.NewEngine(
-		ksFactory,
-		grepFactory,
-		docInfoFactory,
-		listChunksFactory,
-		listBasesFactory,
-		toolFactory,
-		a.cfg.Agent,
-	)
+	// ── 注册内置工具（按 Order 升序出现在 prompt "可用工具" 段） ──
+	agentEngine.RegisterInternal("knowledge_search", 1, false,
+		func(ctx context.Context, userID string, kbIDs []string) einoTool.BaseTool {
+			return tool.NewKnowledgeSearchTool(vectorRetriever).WithContext(userID, kbIDs)
+		})
+	agentEngine.RegisterInternal("grep_chunks", 2, false,
+		func(ctx context.Context, userID string, kbIDs []string) einoTool.BaseTool {
+			return tool.NewGrepChunksTool(chunkRepo)(userID, kbIDs)
+		})
+	agentEngine.RegisterInternal("get_document_info", 3, false,
+		func(ctx context.Context, userID string, kbIDs []string) einoTool.BaseTool {
+			return tool.NewGetDocumentInfoTool(documentRepo)(userID, kbIDs)
+		})
+	agentEngine.RegisterInternal("list_knowledge_chunks", 4, false,
+		func(ctx context.Context, userID string, kbIDs []string) einoTool.BaseTool {
+			return tool.NewListKnowledgeChunksTool(documentRepo)(userID, kbIDs)
+		})
+	agentEngine.RegisterInternal("list_knowledge_bases", 5, false,
+		func(ctx context.Context, userID string, kbIDs []string) einoTool.BaseTool {
+			return tool.NewListKnowledgeBasesTool(kbRepo)(userID, kbIDs)
+		})
+	agentEngine.RegisterInternal("delete_document", 10, true,
+		func(ctx context.Context, userID string, kbIDs []string) einoTool.BaseTool {
+			return tool.NewDeleteDocumentTool(documentRepo)(userID, kbIDs)
+		})
+	agentEngine.RegisterInternal("ask_clarify", 20, false,
+		func(ctx context.Context, userID string, kbIDs []string) einoTool.BaseTool {
+			return tool.NewAskClarifyTool()(userID, kbIDs)
+		})
 
 	return &AgentComponents{
 		Retriever:   vectorRetriever,
@@ -288,6 +366,40 @@ func (a *App) initDependencies() {
 	dingtalkBindingRepo := repository.NewDingTalkBindingRepository(a.postgresqlDB)
 	storageQuotaRepo := repository.NewStorageQuotaRepository(a.postgresqlDB)
 	userRepo := repository.NewUserRepository(a.postgresqlDB)
+	userPreferenceRepo := repository.NewUserPreferenceRepository(a.postgresqlDB)
+	obsRepo := repository.NewObservabilityRepository(a.postgresqlDB)
+	agentCheckpointRepo := repository.NewAgentCheckpointRepository(a.postgresqlDB)
+
+	// 阶段 1.4：可观测性初始化（OTel Tracer + Prometheus Registry + Recorder）
+	//
+	// 顺序很重要：必须先 InitTracerProvider / InitPrometheusRegistry，再 NewRecorder，
+	// 否则 NewRecorder 拿到的 GlobalMetrics() 是兜底空 metrics，/metrics 路由不会暴露真实指标。
+	obsCfg := a.cfg.Observability
+	ctx := context.Background()
+	tp, tracerShutdown, err := observability.InitTracerProvider(ctx, obsCfg)
+	if err != nil {
+		logger.Warnf("OTel TracerProvider 初始化失败，回退 noop: %v", err)
+	} else {
+		a.tracerShutdown = tracerShutdown
+		if tp != nil {
+			logger.Infof("OTel TracerProvider 已初始化: exporter=%s sample_rate=%.2f", obsCfg.OTelExporter, obsCfg.OTelSamplingRate)
+		}
+	}
+	promReg := observability.InitPrometheusRegistry(obsCfg)
+	a.promRegistry = promReg
+	logger.Infof("Prometheus Registry 已初始化")
+
+	// 阶段三：初始化可观测性 Recorder（DB Sink + 批量日志 Sink + 采样器 + PII）
+	// NewRecorder 内部调 GlobalMetrics() / GlobalTracer()，已经在上一步被赋值
+	if !obsCfg.Enabled {
+		a.obsRecorder = observability.NewRecorder(obsCfg)
+	} else {
+		a.obsRecorder = observability.NewRecorderWithDBSink(obsCfg, obsRepo)
+	}
+	logger.Infof("可观测性模块初始化: enabled=%v sample_rate=%.2f db_sink=%v otel_exporter=%s", obsCfg.Enabled, obsCfg.SamplingRate, obsCfg.TraceTableEnabled, obsCfg.OTelExporter)
+	// 注册 eino 全局 callback：所有走 eino 标准接口的组件（ChatModel / Retriever / Tool / Embedding / Agent / Graph）
+	// 会自动打 span 和通用指标，不用再在业务代码里手动成对 StartSpan/EndSpan。
+	observability.RegisterGlobalEinoCallback(a.obsRecorder)
 
 	// 模型配置缓存（10 分钟 TTL）
 	modelCache := cache.New(a.redis, "model:", 10*time.Minute)
@@ -295,7 +407,7 @@ func (a *App) initDependencies() {
 	userModelConfigRepo := repository.NewCachedUserModelConfigRepository(repository.NewUserModelConfigRepository(a.postgresqlDB), modelCache)
 	chatSessionRepo := repository.NewChatSessionRepository(a.postgresqlDB)
 	chatMessageRepo := repository.NewChatMessageRepository(a.postgresqlDB)
-	memoryRepo := repository.NewMemoryRepository(a.postgresqlDB)
+	memoryRepo := repository.NewUserMemoryRepository(a.postgresqlDB)
 	summaryRepo := repository.NewSummaryRepository(a.postgresqlDB)
 	// 工具配置——原始仓库
 	toolTypeRepo := repository.NewToolTypeRepository(a.postgresqlDB)
@@ -320,13 +432,17 @@ func (a *App) initDependencies() {
 	toolFactory := tool.NewFactory(toolRegistry, cachedUserToolConfigRepo, cachedToolTypeRepo)
 
 	// Chunk Repository（文档分块查询）
-	chunkRepo := repository.NewChunkRepository(a.postgresqlDB)
+	chunkRepo := repository.NewDocumentChunkRepository(a.postgresqlDB)
 
 	// 初始化 Agent 组件（传入 ToolFactory + DocumentRepo + ChunkRepo + KnowledgeBaseRepo）
 	ai := a.initAgentComponents(toolFactory, documentRepo, chunkRepo, knowledgeBaseRepo)
 
+	// 注入 DB 版 CheckPointStore 所需的 AgentCheckpointRepo
+	ai.AgentEngine.WithCheckpointRepo(agentCheckpointRepo)
+
 	// 初始化 Service
-	userSvc := service.NewUserService(userRepo)
+	prefSvc := service.NewUserPreferenceService(userPreferenceRepo)
+	userSvc := service.NewUserService(userRepo, prefSvc, userModelCache)
 	adminUserSvc := service.NewAdminUserService(userRepo)
 	adminSessionSvc := service.NewAdminSessionService(chatSessionRepo, chatMessageRepo)
 	authSvc := service.NewAuthService(userRepo, userSvc, a.redis)
@@ -346,14 +462,15 @@ func (a *App) initDependencies() {
 	dingtalkSvc := service.NewDingTalkService(a.cfg.DingTalk, dingtalkBindingRepo, dingtalkStateCache, dingtalkClient)
 	syncSvc := service.NewSyncService(knowledgeBaseRepo, syncSourceRepo, syncJobRepo, syncItemRepo, syncedDocumentRepo, dingtalkBindingRepo, documentChunkSvc, textExtractor, dingtalkClient, "data/uploads")
 	storageSvc := service.NewStorageService(storageQuotaRepo)
-	contextSvc := service.NewContextService(chatMessageRepo, memoryRepo, summaryRepo)
-	chatSvc := service.NewChatService(chatSessionRepo, chatMessageRepo, ai.Retriever, modelRepo, userModelConfigRepo, userRepo, userModelCache, ai.AgentEngine, contextSvc)
+	contextSvc := service.NewContextService(chatMessageRepo, memoryRepo, summaryRepo, a.obsRecorder)
+	chatSvc := service.NewChatService(chatSessionRepo, chatMessageRepo, ai.Retriever, modelRepo, userModelConfigRepo, userRepo, userModelCache, ai.AgentEngine, contextSvc, prefSvc, a.obsRecorder, obsRepo)
 	toolTypeService := service.NewToolTypeService(cachedToolTypeRepo)
 	toolProviderService := service.NewToolProviderService(toolProviderRepo, cachedToolTypeRepo, toolRegistry)
 	userToolConfigService := service.NewUserToolConfigService(cachedUserToolConfigRepo, cachedToolTypeRepo, toolProviderRepo, toolRegistry)
 	searchSvc := service.NewSearchService(chatMessageRepo, chunkRepo)
 
 	// 路由
+	// 阶段 1.4：把 Prometheus Registry 注入 Router，/metrics 路由直接挂 promhttp.HandlerFor(promReg)
 	a.router = api.NewRouter(
 		userSvc,
 		adminUserSvc,
@@ -371,7 +488,10 @@ func (a *App) initDependencies() {
 		chunkRepo,
 		toolTypeService,
 		toolProviderService,
-		userToolConfigService)
+		userToolConfigService,
+		prefSvc,
+		a.promRegistry, // 阶段 1.4：替换原 obsRecorder，/metrics 走 promhttp.Handler
+	)
 }
 
 // prewarmModelClients 启动时预创建所有已启用系统模型的 LLM 客户端
@@ -406,6 +526,10 @@ func (a *App) initServer() {
 	engine.Use(middleware.Recovery())
 	engine.Use(middleware.CORS())
 	engine.Use(middleware.Logger())
+	if a.obsRecorder != nil {
+		// 阶段三：可观测性链路中间件（生成 request_id、记录 HTTP 指标、panic 恢复）
+		engine.Use(observability.NewTraceMiddleware(a.obsRecorder).Handler())
+	}
 	a.router.Setup(engine)
 
 	a.server = &http.Server{
@@ -429,6 +553,23 @@ func (a *App) gracefulShutdown() {
 
 	if err := a.server.Shutdown(ctx); err != nil {
 		logger.Fatal("HTTP 服务关闭失败", zap.Error(err))
+	}
+
+	// 阶段三：优雅关闭可观测性 recorder（刷新批量 Sink）
+	if a.obsRecorder != nil {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutdownCancel()
+		if err := a.obsRecorder.Shutdown(shutdownCtx); err != nil {
+			logger.Errorf("可观测性 recorder 关闭失败: %v", err)
+		}
+	}
+	// 阶段 1.4：优雅关闭 OTel TracerProvider（flush 还在 batcher 里的 span 到 exporter）
+	if a.tracerShutdown != nil {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutdownCancel()
+		if err := a.tracerShutdown(shutdownCtx); err != nil {
+			logger.Errorf("OTel TracerProvider 关闭失败: %v", err)
+		}
 	}
 
 	if a.postgresqlDB != nil {

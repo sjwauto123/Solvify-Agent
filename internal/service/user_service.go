@@ -1,26 +1,35 @@
 package service
 
 import (
+	"context"
 	"strings"
+	"time"
 
 	"solvify-agent/internal/model/dto/request"
 	dto "solvify-agent/internal/model/dto/response"
 	"solvify-agent/internal/model/entity"
 	"solvify-agent/internal/repository"
+	"solvify-agent/pkg/cache"
 	apperrors "solvify-agent/pkg/errors"
+	"solvify-agent/pkg/logger"
 	"solvify-agent/pkg/response"
 
 	"golang.org/x/crypto/bcrypt"
 )
 
+// userService 用户业务服务实现
 type userService struct {
-	userRepo repository.UserRepository
+	userRepo  repository.UserRepository
+	prefSvc   UserPreferenceService
+	userCache *cache.RedisCache
 }
 
 // NewUserService 创建用户服务
-func NewUserService(userRepo repository.UserRepository) UserServiceInterface {
+func NewUserService(userRepo repository.UserRepository, prefSvc UserPreferenceService, userCache *cache.RedisCache) UserServiceInterface {
 	return &userService{
-		userRepo: userRepo,
+		userRepo:  userRepo,
+		prefSvc:   prefSvc,
+		userCache: userCache,
 	}
 }
 
@@ -62,6 +71,8 @@ func (s *userService) Register(req *request.RegisterRequest) error {
 }
 
 // GetUserByID 根据 ID 获取用户
+// last_model 字段走 cache-aside：先读缓存，命中则用缓存值覆盖 DB 读到的值；
+// 未命中则用 DB 值回填缓存（24h TTL，与 chat_service.updateUserLastModel 一致）
 func (s *userService) GetUserByID(id string) (*entity.User, error) {
 	user, err := s.userRepo.FindByID(id)
 	if err != nil {
@@ -70,6 +81,25 @@ func (s *userService) GetUserByID(id string) (*entity.User, error) {
 	if user == nil {
 		return nil, apperrors.New(apperrors.CodeUserNotFound, "用户不存在")
 	}
+
+	// cache-aside：last_model 优先走缓存，避免 DB 写入延迟导致读到旧值
+	if s.userCache != nil {
+		cacheKey := "user:model:" + id
+		var cachedModelID string
+		found, cacheErr := s.userCache.Get(context.Background(), cacheKey, &cachedModelID)
+		if cacheErr != nil {
+			logger.Errorf("读取用户模型缓存失败: userID=%s, err=%v", id, cacheErr)
+		}
+		if found && cachedModelID != "" {
+			user.LastModel = cachedModelID
+		} else if user.LastModel != "" {
+			// DB 有值但缓存未命中，回填缓存
+			if cacheErr := s.userCache.Set(context.Background(), cacheKey, user.LastModel, 24*time.Hour); cacheErr != nil {
+				logger.Errorf("回填用户模型缓存失败: userID=%s, err=%v", id, cacheErr)
+			}
+		}
+	}
+
 	return user, nil
 }
 
@@ -105,6 +135,38 @@ func (s *userService) UpdateUser(id string, req *request.UpdateUserRequest) erro
 	return s.userRepo.Update(id, updates)
 }
 
+// UpdateProfile 更新用户画像字段（部门/职位/擅长/语言/时区）
+func (s *userService) UpdateProfile(id string, req *request.UpdateProfileRequest) error {
+	user, err := s.GetUserByID(id)
+	if err != nil {
+		return err
+	}
+	dept := req.Department
+	pos := req.Position
+	exp := req.Expertise
+	lang := req.PreferredLanguage
+	tz := req.Timezone
+	upd := &repository.UserProfileUpdate{
+		Department:        nonEmptyPtrOrNil(dept, &user.Department),
+		Position:          nonEmptyPtrOrNil(pos, &user.Position),
+		Expertise:         nonEmptyPtrOrNil(exp, &user.Expertise),
+		PreferredLanguage: nonEmptyPtrOrNil(lang, &user.PreferredLanguage),
+		Timezone:          nonEmptyPtrOrNil(tz, &user.Timezone),
+	}
+	return s.userRepo.UpdateProfile(id, upd)
+}
+
+// nonEmptyPtrOrNil 非空且与当前值不同则取地址，否则返回 nil
+func nonEmptyPtrOrNil(s string, cur *string) *string {
+	if s == "" {
+		return nil
+	}
+	if cur != nil && s == *cur {
+		return nil
+	}
+	return &s
+}
+
 // ChangePassword 修改密码
 func (s *userService) ChangePassword(id string, req *request.ChangePasswordRequest) error {
 	// 1. 先确认用户存在，并校验旧密码是否正确
@@ -132,16 +194,36 @@ func (s *userService) ChangePassword(id string, req *request.ChangePasswordReque
 // GetUserResponse 构造用户响应对象
 func (s *userService) GetUserResponse(user *entity.User) *dto.UserResponse {
 	return &dto.UserResponse{
-		ID:        user.ID,
-		Username:  user.Username,
-		Email:     user.Email,
-		Avatar:    user.Avatar,
-		Status:    user.Status,
-		Role:      user.Role,
-		LastModel: user.LastModel,
-		CreatedAt: user.CreatedAt,
-		UpdatedAt: user.UpdatedAt,
+		ID:                user.ID,
+		Username:          user.Username,
+		Email:             user.Email,
+		Avatar:            user.Avatar,
+		Status:            user.Status,
+		Role:              user.Role,
+		LastModel:         user.LastModel,
+		Department:        user.Department,
+		Position:          user.Position,
+		Expertise:         user.Expertise,
+		PreferredLanguage: user.PreferredLanguage,
+		Timezone:          user.Timezone,
+		CreatedAt:         user.CreatedAt,
+		UpdatedAt:         user.UpdatedAt,
 	}
+}
+
+// GetProfile 合并返回 基本信息 + 偏好
+func (s *userService) GetProfile(id string) (*dto.ProfileResponse, error) {
+	user, err := s.GetUserByID(id)
+	if err != nil {
+		return nil, err
+	}
+	profile := &dto.ProfileResponse{User: *s.GetUserResponse(user)}
+	if s.prefSvc != nil {
+		if p, e := s.prefSvc.GetByUserID(context.Background(), id); e == nil {
+			profile.Preference = *s.prefSvc.ToDTO(p)
+		}
+	}
+	return profile, nil
 }
 
 // AdminListUsers 管理员分页查询用户列表
