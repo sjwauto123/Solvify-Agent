@@ -113,20 +113,17 @@ jobs:
       - name: 生成镜像名称
         id: image-names
         shell: bash
-        env:
-          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
         run: |
-          user="${DOCKERHUB_USERNAME}"
-          echo "backend=docker.io/${user}/solvify-agent-backend" >> "$GITHUB_OUTPUT"
-          echo "frontend=docker.io/${user}/solvify-agent-frontend" >> "$GITHUB_OUTPUT"
+          echo "backend=ccr.ccs.tencentcloud.com/solvify/solvify-agent-backend" >> "$GITHUB_OUTPUT"
+          echo "frontend=ccr.ccs.tencentcloud.com/solvify/solvify-agent-frontend" >> "$GITHUB_OUTPUT"
 
-      - name: 登录 Docker Hub
+      - name: 登录腾讯云 TCR
         if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
         uses: docker/login-action@v4
         with:
-          registry: docker.io
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: ccr.ccs.tencentcloud.com
+          username: ${{ secrets.TCR_USERNAME }}
+          password: ${{ secrets.TCR_TOKEN }}
 
       - name: 配置 Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -222,8 +219,8 @@ jobs:
 
       - name: 渲染并上传 k3s 清单
         env:
-          BACKEND_IMAGE: docker.io/${{ secrets.DOCKERHUB_USERNAME }}/solvify-agent-backend:${{ github.sha }}
-          FRONTEND_IMAGE: docker.io/${{ secrets.DOCKERHUB_USERNAME }}/solvify-agent-frontend:${{ github.sha }}
+          BACKEND_IMAGE: ccr.ccs.tencentcloud.com/solvify/solvify-agent-backend:${{ github.sha }}
+          FRONTEND_IMAGE: ccr.ccs.tencentcloud.com/solvify/solvify-agent-frontend:${{ github.sha }}
           RELEASE_DIR: /opt/solvify-agent/releases/${{ github.sha }}/k3s
         run: |
           WORK_DIR="${{ runner.temp }}/solvify-k3s"
