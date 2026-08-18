@@ -116,7 +116,7 @@ jobs:
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
         run: |
-          user="${DOCKERHUB_USERNAME,,}"
+          user="${DOCKERHUB_USERNAME}"
           echo "backend=docker.io/${user}/solvify-agent-backend" >> "$GITHUB_OUTPUT"
           echo "frontend=docker.io/${user}/solvify-agent-frontend" >> "$GITHUB_OUTPUT"
 
@@ -222,8 +222,8 @@ jobs:
 
       - name: 渲染并上传 k3s 清单
         env:
-          BACKEND_IMAGE: ${{ needs.images.outputs.backend-image }}:${{ github.sha }}
-          FRONTEND_IMAGE: ${{ needs.images.outputs.frontend-image }}:${{ github.sha }}
+          BACKEND_IMAGE: docker.io/${{ secrets.DOCKERHUB_USERNAME }}/solvify-agent-backend:${{ github.sha }}
+          FRONTEND_IMAGE: docker.io/${{ secrets.DOCKERHUB_USERNAME }}/solvify-agent-frontend:${{ github.sha }}
           RELEASE_DIR: /opt/solvify-agent/releases/${{ github.sha }}/k3s
         run: |
           WORK_DIR="${{ runner.temp }}/solvify-k3s"
