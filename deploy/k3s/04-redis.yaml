@@ -52,7 +52,7 @@ spec:
               command:
                 - /bin/sh
                 - -c
-                - redis-cli -a "$(REDIS_PASSWORD)" ping 2>/dev/null | grep -q PONG
+                - redis-cli -a "${REDIS_PASSWORD}" ping 2>/dev/null | grep -q PONG
             initialDelaySeconds: 5
             periodSeconds: 10
             timeoutSeconds: 3
