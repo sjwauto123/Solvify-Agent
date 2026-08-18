@@ -113,18 +113,20 @@ jobs:
       - name: 生成镜像名称
         id: image-names
         shell: bash
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
         run: |
-          repository="${GITHUB_REPOSITORY,,}"
-          echo "backend=ghcr.io/${repository}-backend" >> "$GITHUB_OUTPUT"
-          echo "frontend=ghcr.io/${repository}-frontend" >> "$GITHUB_OUTPUT"
+          user="${DOCKERHUB_USERNAME,,}"
+          echo "backend=docker.io/${user}/solvify-agent-backend" >> "$GITHUB_OUTPUT"
+          echo "frontend=docker.io/${user}/solvify-agent-frontend" >> "$GITHUB_OUTPUT"
 
-      - name: 登录 GHCR
+      - name: 登录 Docker Hub
         if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
         uses: docker/login-action@v4
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: 配置 Docker Buildx
         uses: docker/setup-buildx-action@v4

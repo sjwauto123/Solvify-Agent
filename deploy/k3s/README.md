@@ -52,18 +52,18 @@ kubectl -n solvify-agent rollout restart statefulset/postgres deployment/redis d
 
 ## 4. 镜像来源
 
-后端/前端镜像沿用原流程推送到 **GHCR 公开镜像**（仓库首次发布后需在 GitHub Packages 设为 Public），k3s 节点匿名拉取。若设为私有，请在 `05-backend.yaml` / `06-frontend.yaml` 增加 `imagePullSecrets`。
+后端/前端镜像推送到 **Docker Hub 公开镜像**。国内服务器通过已配置的 DaoCloud 镜像 `docker.m.daocloud.io` 加速拉取（规避 ghcr.io 从国内拉取被限速到 ~100KB/s 的问题）。仓库需为 Public，否则请在 `05-backend.yaml` / `06-frontend.yaml` 增加 `imagePullSecrets`。
 
 镜像标签格式（与 CI/CD 中保持一致）：
 
-- `ghcr.io/<仓库名小写>-backend:<commit-sha>`
-- `ghcr.io/<仓库名小写>-frontend:<commit-sha>`
+- `docker.io/<DOCKERHUB_USERNAME>/solvify-agent-backend:<commit-sha>`
+- `docker.io/<DOCKERHUB_USERNAME>/solvify-agent-frontend:<commit-sha>`
 
 ## 5. 部署方式
 
 ### 方式 A：GitHub Actions（推荐，自动）
 
-推送 `main` 后，Actions 会：构建前后端镜像 → 注入 SHA 标签 → SSH 上传 `deploy/k3s/*` 与初始化 SQL → `kubectl apply`。所需 GitHub Secrets 与原 Compose 方案相同：`DEPLOY_HOST` / `DEPLOY_PORT` / `DEPLOY_USER` / `DEPLOY_SSH_KEY` / `DEPLOY_KNOWN_HOSTS`。
+推送 `main` 后，Actions 会：构建前后端镜像 → 注入 SHA 标签 → SSH 上传 `deploy/k3s/*` 与初始化 SQL → `kubectl apply`。所需 GitHub Secrets：`DEPLOY_HOST` / `DEPLOY_PORT` / `DEPLOY_USER` / `DEPLOY_SSH_KEY` / `DEPLOY_KNOWN_HOSTS`，以及镜像仓库 `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN`。
 
 ### 方式 B：手动
 
