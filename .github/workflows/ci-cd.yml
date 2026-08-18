@@ -192,9 +192,16 @@ jobs:
           test -n "$DEPLOY_KNOWN_HOSTS"
 
           install -d -m 0700 "$HOME/.ssh"
-          printf '%s\n' "$DEPLOY_SSH_KEY" > "$HOME/.ssh/solvify_deploy"
-          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          # 去除 Windows CRLF（\r）：否则 OpenSSH 加载私钥报 "error in libcrypto"、known_hosts 也可能对不上
+          printf '%s\n' "$DEPLOY_SSH_KEY" | tr -d '\r' > "$HOME/.ssh/solvify_deploy"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" | tr -d '\r' > "$HOME/.ssh/known_hosts"
           chmod 0600 "$HOME/.ssh/solvify_deploy" "$HOME/.ssh/known_hosts"
+
+          # 校验私钥可被 OpenSSH 解析（失败给出清晰提示，而非后面模糊的 publickey）
+          ssh-keygen -y -P "" -f "$HOME/.ssh/solvify_deploy" > /dev/null 2>&1 || {
+            echo "DEPLOY_SSH_KEY 私钥无法解析：请确认完整粘贴了私钥（含 -----BEGIN/END----- 两行、中间无多余换行/空格）"
+            exit 1
+          }
 
           {
             echo "Host solvify-production"
