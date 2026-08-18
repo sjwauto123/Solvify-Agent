@@ -266,8 +266,8 @@ jobs:
             sudo KUBECONFIG="$KUBECONFIG" kubectl -n solvify-agent apply -f "$RELEASE_DIR/04-redis.yaml"
             sudo KUBECONFIG="$KUBECONFIG" kubectl -n solvify-agent apply -f "$RELEASE_DIR/05-backend.yaml"
             sudo KUBECONFIG="$KUBECONFIG" kubectl -n solvify-agent apply -f "$RELEASE_DIR/06-frontend.yaml"
-            sudo KUBECONFIG="$KUBECONFIG" kubectl -n solvify-agent rollout status deployment/backend --timeout=180s
-            sudo KUBECONFIG="$KUBECONFIG" kubectl -n solvify-agent rollout status deployment/frontend --timeout=180s
+            sudo KUBECONFIG="$KUBECONFIG" kubectl -n solvify-agent rollout status deployment/backend --timeout=300s
+            sudo KUBECONFIG="$KUBECONFIG" kubectl -n solvify-agent rollout status deployment/frontend --timeout=300s
           EOF
 
       - name: 外部健康检查
