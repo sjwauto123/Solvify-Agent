@@ -86,7 +86,8 @@ jobs:
           mv "$VALIDATION_ROOT/05-backend.rendered.yaml" "$VALIDATION_ROOT/05-backend.yaml"
           envsubst < "$VALIDATION_ROOT/06-frontend.yaml" > "$VALIDATION_ROOT/06-frontend.rendered.yaml"
           mv "$VALIDATION_ROOT/06-frontend.rendered.yaml" "$VALIDATION_ROOT/06-frontend.yaml"
-          kubectl apply --dry-run=client -f "$VALIDATION_ROOT/" --recursive
+          # --dry-run=client + --validate=false：仅本地做 YAML/结构预检，不连 API Server（runner 上无集群）
+          kubectl apply --dry-run=client --validate=false -f "$VALIDATION_ROOT/" --recursive
 
   images:
     name: 构建并发布镜像
