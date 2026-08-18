@@ -59,41 +59,34 @@ jobs:
         run: npm run build
 
   deployment-check:
-    name: 部署配置检查
+    name: 部署配置检查（k3s 清单）
     runs-on: ubuntu-latest
     steps:
       - name: 检出代码
         uses: actions/checkout@v6
 
+      - name: 安装 kubectl
+        run: |
+          curl -fsSL -o /usr/local/bin/kubectl \
+            "https://dl.k8s.io/release/v1.30.0/bin/linux/amd64/kubectl"
+          chmod +x /usr/local/bin/kubectl
+
       - name: 检查 Shell 语法
-        run: bash -n deploy/deploy.sh deploy/server-bootstrap.sh
+        run: bash -n deploy/k3s/apply.sh
 
-      - name: 准备 Compose 检查配置
+      - name: 校验 k3s 清单（渲染镜像标签后 client 预检）
         env:
-          VALIDATION_ROOT: ${{ runner.temp }}/solvify-agent
+          BACKEND_IMAGE: ghcr.io/example/solvify-agent-backend:ci
+          FRONTEND_IMAGE: ghcr.io/example/solvify-agent-frontend:ci
         run: |
-          mkdir -p "$VALIDATION_ROOT/shared"
-          cp deploy/.env.production.example "$VALIDATION_ROOT/shared/.env"
-          cp deploy/config.production.yaml.example "$VALIDATION_ROOT/shared/config.yaml"
-          sed -i 's/CHANGE_ME_POSTGRES_PASSWORD/ci-postgres-password/' "$VALIDATION_ROOT/shared/.env"
-          sed -i 's/CHANGE_ME_REDIS_PASSWORD/ci-redis-password/' "$VALIDATION_ROOT/shared/.env"
-          sed -i 's/CHANGE_ME_JWT_SECRET/ci-jwt-secret/' "$VALIDATION_ROOT/shared/config.yaml"
-          {
-            echo "BACKEND_IMAGE=ghcr.io/example/solvify-agent-backend:ci"
-            echo "FRONTEND_IMAGE=ghcr.io/example/solvify-agent-frontend:ci"
-            echo "RELEASE_SHA=0000000000000000000000000000000000000000"
-            echo "SOLVIFY_ROOT=$VALIDATION_ROOT"
-          } > "$VALIDATION_ROOT/shared/.release.env"
-
-      - name: 检查 Compose 配置
-        env:
-          VALIDATION_ROOT: ${{ runner.temp }}/solvify-agent
-        run: |
-          docker compose \
-            --env-file "$VALIDATION_ROOT/shared/.env" \
-            --env-file "$VALIDATION_ROOT/shared/.release.env" \
-            --file deploy/compose.prod.yaml \
-            config --quiet
+          VALIDATION_ROOT="${{ runner.temp }}/solvify-k3s"
+          mkdir -p "$VALIDATION_ROOT"
+          cp -r deploy/k3s/* "$VALIDATION_ROOT/"
+          envsubst < "$VALIDATION_ROOT/05-backend.yaml" > "$VALIDATION_ROOT/05-backend.rendered.yaml"
+          mv "$VALIDATION_ROOT/05-backend.rendered.yaml" "$VALIDATION_ROOT/05-backend.yaml"
+          envsubst < "$VALIDATION_ROOT/06-frontend.yaml" > "$VALIDATION_ROOT/06-frontend.rendered.yaml"
+          mv "$VALIDATION_ROOT/06-frontend.rendered.yaml" "$VALIDATION_ROOT/06-frontend.yaml"
+          kubectl apply --dry-run=client -f "$VALIDATION_ROOT/" --recursive
 
   images:
     name: 构建并发布镜像
@@ -213,41 +206,49 @@ jobs:
 
           ssh solvify-production "printf 'SSH 连接成功\n'"
 
-      - name: 组装部署包
-        env:
-          PACKAGE_DIR: ${{ runner.temp }}/solvify-deploy-package
-        run: |
-          mkdir -p "$PACKAGE_DIR/postgres/init"
-          cp deploy/compose.prod.yaml "$PACKAGE_DIR/"
-          cp deploy/deploy.sh "$PACKAGE_DIR/"
-          cp deploy/server-bootstrap.sh "$PACKAGE_DIR/"
-          cp deploy/.env.production.example "$PACKAGE_DIR/"
-          cp deploy/config.production.yaml.example "$PACKAGE_DIR/"
-          cp scripts/init_knowledge_schema.sql "$PACKAGE_DIR/postgres/init/001-init-schema.sql"
-          tar -C "$PACKAGE_DIR" -czf "${{ runner.temp }}/solvify-deploy-package.tar.gz" .
-
-      - name: 上传部署包
-        env:
-          RELEASE_DIR: /opt/solvify-agent/releases/${{ github.sha }}
-        run: |
-          ssh solvify-production "mkdir -p '$RELEASE_DIR'"
-          scp "${{ runner.temp }}/solvify-deploy-package.tar.gz" \
-            "solvify-production:$RELEASE_DIR/package.tar.gz"
-          ssh solvify-production \
-            "tar -xzf '$RELEASE_DIR/package.tar.gz' -C '$RELEASE_DIR' \
-            && rm -f '$RELEASE_DIR/package.tar.gz' \
-            && chmod 0755 '$RELEASE_DIR/deploy.sh' '$RELEASE_DIR/server-bootstrap.sh'"
-
-      - name: 执行部署
+      - name: 渲染并上传 k3s 清单
         env:
           BACKEND_IMAGE: ${{ needs.images.outputs.backend-image }}:${{ github.sha }}
           FRONTEND_IMAGE: ${{ needs.images.outputs.frontend-image }}:${{ github.sha }}
-          RELEASE_SHA: ${{ github.sha }}
+          RELEASE_DIR: /opt/solvify-agent/releases/${{ github.sha }}/k3s
         run: |
+          WORK_DIR="${{ runner.temp }}/solvify-k3s"
+          mkdir -p "$WORK_DIR"
+          cp -r deploy/k3s/* "$WORK_DIR/"
+          cp scripts/init_knowledge_schema.sql "$WORK_DIR/" 2>/dev/null || true
+          # 把镜像 SHA 标签渲染进后端/前端清单
+          envsubst < "$WORK_DIR/05-backend.yaml" > "$WORK_DIR/05-backend.rendered.yaml"
+          mv "$WORK_DIR/05-backend.rendered.yaml" "$WORK_DIR/05-backend.yaml"
+          envsubst < "$WORK_DIR/06-frontend.yaml" > "$WORK_DIR/06-frontend.rendered.yaml"
+          mv "$WORK_DIR/06-frontend.rendered.yaml" "$WORK_DIR/06-frontend.yaml"
+          tar -C "$WORK_DIR" -czf "${{ runner.temp }}/solvify-k3s.tar.gz" .
+          ssh solvify-production "mkdir -p '$RELEASE_DIR'"
+          scp "${{ runner.temp }}/solvify-k3s.tar.gz" "solvify-production:$RELEASE_DIR/k3s.tar.gz"
           ssh solvify-production \
-            "SOLVIFY_ROOT=/opt/solvify-agent \
-            bash '/opt/solvify-agent/releases/$RELEASE_SHA/deploy.sh' \
-            '$BACKEND_IMAGE' '$FRONTEND_IMAGE' '$RELEASE_SHA'"
+            "tar -xzf '$RELEASE_DIR/k3s.tar.gz' -C '$RELEASE_DIR' \
+            && rm -f '$RELEASE_DIR/k3s.tar.gz'"
+
+      - name: 应用 k3s 清单
+        env:
+          RELEASE_DIR: /opt/solvify-agent/releases/${{ github.sha }}/k3s
+        run: |
+          ssh solvify-production "RELEASE_DIR='$RELEASE_DIR' bash -s" <<'EOF'
+            set -e
+            export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+            # 数据库初始化 SQL（首次建表，已存在则跳过）
+            sudo KUBECONFIG="$KUBECONFIG" kubectl -n solvify-agent create configmap pg-init \
+              --from-file=001-init-schema.sql="$RELEASE_DIR/init_knowledge_schema.sql" \
+              -o yaml --dry-run=client | sudo KUBECONFIG="$KUBECONFIG" kubectl apply -f - || true
+            sudo KUBECONFIG="$KUBECONFIG" kubectl apply -f "$RELEASE_DIR/00-namespace.yaml"
+            sudo KUBECONFIG="$KUBECONFIG" kubectl -n solvify-agent apply -f "$RELEASE_DIR/01-secrets.yaml"
+            sudo KUBECONFIG="$KUBECONFIG" kubectl -n solvify-agent apply -f "$RELEASE_DIR/02-configmap.yaml"
+            sudo KUBECONFIG="$KUBECONFIG" kubectl -n solvify-agent apply -f "$RELEASE_DIR/03-postgres.yaml"
+            sudo KUBECONFIG="$KUBECONFIG" kubectl -n solvify-agent apply -f "$RELEASE_DIR/04-redis.yaml"
+            sudo KUBECONFIG="$KUBECONFIG" kubectl -n solvify-agent apply -f "$RELEASE_DIR/05-backend.yaml"
+            sudo KUBECONFIG="$KUBECONFIG" kubectl -n solvify-agent apply -f "$RELEASE_DIR/06-frontend.yaml"
+            sudo KUBECONFIG="$KUBECONFIG" kubectl -n solvify-agent rollout status deployment/backend --timeout=180s
+            sudo KUBECONFIG="$KUBECONFIG" kubectl -n solvify-agent rollout status deployment/frontend --timeout=180s
+          EOF
 
       - name: 外部健康检查
         env:
