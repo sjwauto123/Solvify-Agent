@@ -8,7 +8,7 @@
 
 - 实例：`lhins-bw1sw356`（名称 Docker CE-Mxx9）
 - 地域：北京 (ap-beijing-7)，公网 `62.234.218.164`
-- 现状：仅装了 Docker CE，还需安装 k3s
+- 现状：已安装 k3s（实际版本 `v1.36.3+k3s1`，k3s v1.30+ 均兼容本套清单）；早期曾仅装 Docker CE
 
 ## 2. 在服务器上准备 k3s（一次性）
 
@@ -19,7 +19,7 @@
 sudo bash deploy/k3s/server-bootstrap.sh
 ```
 
-脚本默认安装 `v1.30.0+k3s1`，与 CI/CD 中 kubectl 版本对齐；如要复用已装的 Docker CE 作运行时，按脚本内注释加 `--docker` 即可。
+脚本默认安装 `v1.30.0+k3s1`（与 CI 中 `kubectl` 客户端版本一致的保守取值）；实际已装上更新的 `v1.36.3+k3s1`，本套清单使用的是 `apps/v1`、`v1` 等稳定 API，在 k3s v1.30+ 任意版本均可正常 apply。如要复用已装的 Docker CE 作运行时，按脚本内注释加 `--docker` 即可。
 
 如需手动操作：
 
@@ -34,15 +34,21 @@ sudo chmod 600 /opt/solvify-agent/k3s.yaml
 
 > GitHub Actions 的 deploy 步骤通过 SSH 登录后使用 `sudo KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl ...` 执行，前提是部署账号拥有免密 sudo。
 
-## 3. 填写密钥（首次部署前必做）
+## 3. 填写密钥（首次部署前必做，仅一次）
 
-清单里所有敏感值都是 `CHANGE_ME_*`，首次部署前必须替换：
+仓库里的 `01-secrets.yaml` 是含 `CHANGE_ME_*` 占位符的模板，**不提交真实密钥**。真实密钥用一个仓库外的本地文件 `01-secrets.local.yaml`（已生成强随机值、已被 `.gitignore` 忽略）一次性 apply：
 
 ```bash
-kubectl -n solvify-agent edit secret solvify-secrets
+# 在本地（kubeconfig 指向目标 k3s）执行，或直接 scp 到服务器跑：
+kubectl apply -f deploy/k3s/01-secrets.local.yaml
+
+# 让 postgres / redis / backend 重新加载新密钥
+kubectl -n solvify-agent rollout restart statefulset/postgres deployment/redis deployment/backend
 ```
 
-至少设置：`POSTGRES_PASSWORD`、`REDIS_PASSWORD`、`config.yaml` 里的 `jwt.secret`（随机串）。
+> CI 的 deploy 步骤已改为「secret 仅在集群中不存在时创建」，所以**重复推送 main 不会把真实密钥冲掉**。若你改了 `01-secrets.local.yaml` 想生效，重新 apply 上面两条命令即可。
+
+替代方案（不想用本地文件）：`kubectl -n solvify-agent edit secret solvify-secrets` 手工改 `POSTGRES_PASSWORD` / `REDIS_PASSWORD` / `config.yaml` 里的 `jwt.secret`（注意 edit 看到的是 base64，需先 `echo -n '值' | base64`）。至少这三项必须设置。
 
 ## 4. 镜像来源
 

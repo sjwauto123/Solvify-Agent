@@ -240,7 +240,13 @@ jobs:
               --from-file=001-init-schema.sql="$RELEASE_DIR/init_knowledge_schema.sql" \
               -o yaml --dry-run=client | sudo KUBECONFIG="$KUBECONFIG" kubectl apply -f - || true
             sudo KUBECONFIG="$KUBECONFIG" kubectl apply -f "$RELEASE_DIR/00-namespace.yaml"
-            sudo KUBECONFIG="$KUBECONFIG" kubectl -n solvify-agent apply -f "$RELEASE_DIR/01-secrets.yaml"
+            # 密钥只在首次（集群里还不存在时）创建，避免覆盖手动设置的真实密钥。
+            # 真实密钥请用仓库外的 deploy/k3s/01-secrets.local.yaml 手动 apply 一次。
+            if ! sudo KUBECONFIG="$KUBECONFIG" kubectl -n solvify-agent get secret solvify-secrets >/dev/null 2>&1; then
+              sudo KUBECONFIG="$KUBECONFIG" kubectl -n solvify-agent apply -f "$RELEASE_DIR/01-secrets.yaml"
+            else
+              echo "secret solvify-secrets 已存在，跳过（不覆盖手动设置的真实密钥）"
+            fi
             sudo KUBECONFIG="$KUBECONFIG" kubectl -n solvify-agent apply -f "$RELEASE_DIR/02-configmap.yaml"
             sudo KUBECONFIG="$KUBECONFIG" kubectl -n solvify-agent apply -f "$RELEASE_DIR/03-postgres.yaml"
             sudo KUBECONFIG="$KUBECONFIG" kubectl -n solvify-agent apply -f "$RELEASE_DIR/04-redis.yaml"
