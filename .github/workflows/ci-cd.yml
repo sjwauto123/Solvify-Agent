@@ -65,29 +65,33 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v6
 
-      - name: 安装 kubectl
-        run: |
-          curl -fsSL -o /usr/local/bin/kubectl \
-            "https://dl.k8s.io/release/v1.30.0/bin/linux/amd64/kubectl"
-          chmod +x /usr/local/bin/kubectl
-
       - name: 检查 Shell 语法
         run: bash -n deploy/k3s/apply.sh
 
-      - name: 校验 k3s 清单（渲染镜像标签后 client 预检）
-        env:
-          BACKEND_IMAGE: ghcr.io/example/solvify-agent-backend:ci
-          FRONTEND_IMAGE: ghcr.io/example/solvify-agent-frontend:ci
+      - name: 校验 k3s 清单（YAML 语法 + 结构，无需集群）
         run: |
-          VALIDATION_ROOT="${{ runner.temp }}/solvify-k3s"
-          mkdir -p "$VALIDATION_ROOT"
-          cp -r deploy/k3s/* "$VALIDATION_ROOT/"
-          envsubst < "$VALIDATION_ROOT/05-backend.yaml" > "$VALIDATION_ROOT/05-backend.rendered.yaml"
-          mv "$VALIDATION_ROOT/05-backend.rendered.yaml" "$VALIDATION_ROOT/05-backend.yaml"
-          envsubst < "$VALIDATION_ROOT/06-frontend.yaml" > "$VALIDATION_ROOT/06-frontend.rendered.yaml"
-          mv "$VALIDATION_ROOT/06-frontend.rendered.yaml" "$VALIDATION_ROOT/06-frontend.yaml"
-          # --dry-run=client + --validate=false：仅本地做 YAML/结构预检，不连 API Server（runner 上无集群）
-          kubectl apply --dry-run=client --validate=false -f "$VALIDATION_ROOT/" --recursive
+          # kubectl apply 即使 --validate=false 仍会连 API Server 做 discovery，runner 无集群会失败；
+          # 这里改用 PyYAML 纯本地解析，校验每个清单可解析且含 apiVersion/kind。
+          python3 -m venv /tmp/solvify-venv
+          /tmp/solvify-venv/bin/pip install --quiet pyyaml
+          /tmp/solvify-venv/bin/python - <<'PY'
+          import glob, sys, yaml
+          files = sorted(glob.glob("deploy/k3s/*.yaml"))
+          if not files:
+              print("错误：deploy/k3s 下没有 .yaml 清单")
+              sys.exit(1)
+          total = 0
+          for f in files:
+              with open(f, encoding="utf-8") as fh:
+                  docs = [d for d in yaml.safe_load_all(fh) if d is not None]
+              for d in docs:
+                  if not (isinstance(d, dict) and d.get("apiVersion") and d.get("kind")):
+                      print(f"错误：{f} 存在缺少 apiVersion/kind 的文档")
+                      sys.exit(1)
+                  print(f"OK  {f}  ->  {d['apiVersion']}  {d['kind']}")
+                  total += 1
+          print(f"共校验 {len(files)} 个文件 / {total} 个资源，全部通过")
+          PY
 
   images:
     name: 构建并发布镜像
