@@ -33,6 +33,7 @@ spec:
       containers:
         - name: backend
           image: "${BACKEND_IMAGE}"
+          imagePullPolicy: Never
           ports:
             - containerPort: 8080
           envFrom:

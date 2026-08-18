@@ -21,6 +21,7 @@ spec:
       containers:
         - name: frontend
           image: "${FRONTEND_IMAGE}"
+          imagePullPolicy: Never
           ports:
             - containerPort: 80
           readinessProbe:
