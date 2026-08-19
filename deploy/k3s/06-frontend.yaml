@@ -20,7 +20,7 @@ spec:
     spec:
       containers:
         - name: frontend
-          image: "${FRONTEND_IMAGE}"
+          image: "docker.io/library/solvify-agent-frontend:local"
           imagePullPolicy: Never
           ports:
             - containerPort: 80

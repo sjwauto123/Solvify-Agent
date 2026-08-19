@@ -32,7 +32,7 @@ spec:
     spec:
       containers:
         - name: backend
-          image: "${BACKEND_IMAGE}"
+          image: "docker.io/library/solvify-agent-backend:local"
           imagePullPolicy: Never
           ports:
             - containerPort: 8080

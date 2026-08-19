@@ -93,64 +93,13 @@ jobs:
           print(f"共校验 {len(files)} 个文件 / {total} 个资源，全部通过")
           PY
 
-  images:
-    name: 构建镜像
+  deploy:
+    name: 部署生产环境（服务器本地构建）
     runs-on: ubuntu-latest
     needs:
       - go-check
       - frontend-check
       - deployment-check
-    steps:
-      - name: 检出代码
-        uses: actions/checkout@v6
-
-      - name: 配置 Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: 构建后端镜像
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          file: deploy/Dockerfile
-          platforms: linux/amd64
-          push: false
-          load: true
-          tags: docker.io/library/solvify-agent-backend:${{ github.sha }}
-          cache-from: type=gha,scope=backend
-          cache-to: type=gha,scope=backend,mode=max
-
-      - name: 导出后端镜像
-        run: docker save -o backend.tar docker.io/library/solvify-agent-backend:${{ github.sha }}
-
-      - name: 构建前端镜像
-        uses: docker/build-push-action@v7
-        with:
-          context: design/vue
-          file: design/vue/Dockerfile
-          platforms: linux/amd64
-          push: false
-          load: true
-          tags: docker.io/library/solvify-agent-frontend:${{ github.sha }}
-          cache-from: type=gha,scope=frontend
-          cache-to: type=gha,scope=frontend,mode=max
-
-      - name: 导出前端镜像
-        run: docker save -o frontend.tar docker.io/library/solvify-agent-frontend:${{ github.sha }}
-
-      - name: 上传镜像包
-        uses: actions/upload-artifact@v4
-        with:
-          name: solvify-images
-          path: |
-            backend.tar
-            frontend.tar
-          if-no-files-found: error
-
-  deploy:
-    name: 部署生产环境
-    runs-on: ubuntu-latest
-    needs:
-      - images
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     environment:
       name: production
@@ -198,70 +147,39 @@ jobs:
             echo "  BatchMode yes"
             echo "  StrictHostKeyChecking yes"
             echo "  UserKnownHostsFile $HOME/.ssh/known_hosts"
+            echo "  ServerAliveInterval 30"
+            echo "  ServerAliveCountMax 20"
           } > "$HOME/.ssh/config"
           chmod 0600 "$HOME/.ssh/config"
 
           ssh solvify-production "printf 'SSH 连接成功\n'"
 
-      - name: 下载镜像包
-        uses: actions/download-artifact@v4
-        with:
-          name: solvify-images
-
-      - name: 上传并导入镜像到服务器
+      - name: 同步源码到服务器
         run: |
-          scp backend.tar frontend.tar "solvify-production:/tmp/"
-          ssh solvify-production "sudo k3s ctr -n k8s.io images import /tmp/backend.tar && sudo k3s ctr -n k8s.io images import /tmp/frontend.tar"
+          tar --exclude='.git' --exclude='design/vue/node_modules' -czf "${{ runner.temp }}/solvify-src.tar.gz" .
+          scp "${{ runner.temp }}/solvify-src.tar.gz" "solvify-production:/tmp/solvify-src.tar.gz"
+          ssh solvify-production "sudo mkdir -p /opt/solvify-agent/src && sudo tar -xzf /tmp/solvify-src.tar.gz -C /opt/solvify-agent/src && sudo rm -f /tmp/solvify-src.tar.gz"
 
-      - name: 渲染并上传 k3s 清单
-        env:
-          BACKEND_IMAGE: docker.io/library/solvify-agent-backend:${{ github.sha }}
-          FRONTEND_IMAGE: docker.io/library/solvify-agent-frontend:${{ github.sha }}
-          RELEASE_DIR: /opt/solvify-agent/releases/${{ github.sha }}/k3s
+      - name: 应用基础设施清单
         run: |
-          WORK_DIR="${{ runner.temp }}/solvify-k3s"
-          mkdir -p "$WORK_DIR"
-          cp -r deploy/k3s/* "$WORK_DIR/"
-          cp scripts/init_knowledge_schema.sql "$WORK_DIR/" 2>/dev/null || true
-          # 把镜像 SHA 标签渲染进后端/前端清单
-          envsubst < "$WORK_DIR/05-backend.yaml" > "$WORK_DIR/05-backend.rendered.yaml"
-          mv "$WORK_DIR/05-backend.rendered.yaml" "$WORK_DIR/05-backend.yaml"
-          envsubst < "$WORK_DIR/06-frontend.yaml" > "$WORK_DIR/06-frontend.rendered.yaml"
-          mv "$WORK_DIR/06-frontend.rendered.yaml" "$WORK_DIR/06-frontend.yaml"
-          tar -C "$WORK_DIR" -czf "${{ runner.temp }}/solvify-k3s.tar.gz" .
-          ssh solvify-production "mkdir -p '$RELEASE_DIR'"
-          scp "${{ runner.temp }}/solvify-k3s.tar.gz" "solvify-production:$RELEASE_DIR/k3s.tar.gz"
-          ssh solvify-production \
-            "tar -xzf '$RELEASE_DIR/k3s.tar.gz' -C '$RELEASE_DIR' \
-            && rm -f '$RELEASE_DIR/k3s.tar.gz'"
-
-      - name: 应用 k3s 清单
-        env:
-          RELEASE_DIR: /opt/solvify-agent/releases/${{ github.sha }}/k3s
-        run: |
-          ssh solvify-production "RELEASE_DIR='$RELEASE_DIR' bash -s" <<'EOF'
+          ssh solvify-production "bash -s" <<'EOF'
             set -e
             export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
-            # 数据库初始化 SQL（首次建表，已存在则跳过）
-            sudo KUBECONFIG="$KUBECONFIG" kubectl -n solvify-agent create configmap pg-init \
-              --from-file=001-init-schema.sql="$RELEASE_DIR/init_knowledge_schema.sql" \
-              -o yaml --dry-run=client | sudo KUBECONFIG="$KUBECONFIG" kubectl apply -f - || true
-            sudo KUBECONFIG="$KUBECONFIG" kubectl apply -f "$RELEASE_DIR/00-namespace.yaml"
+            sudo KUBECONFIG="$KUBECONFIG" kubectl apply -f /opt/solvify-agent/src/deploy/k3s/00-namespace.yaml
             # 密钥只在首次（集群里还不存在时）创建，避免覆盖手动设置的真实密钥。
-            # 真实密钥请用仓库外的 deploy/k3s/01-secrets.local.yaml 手动 apply 一次。
             if ! sudo KUBECONFIG="$KUBECONFIG" kubectl -n solvify-agent get secret solvify-secrets >/dev/null 2>&1; then
-              sudo KUBECONFIG="$KUBECONFIG" kubectl -n solvify-agent apply -f "$RELEASE_DIR/01-secrets.yaml"
+              sudo KUBECONFIG="$KUBECONFIG" kubectl -n solvify-agent apply -f /opt/solvify-agent/src/deploy/k3s/01-secrets.yaml
             else
               echo "secret solvify-secrets 已存在，跳过（不覆盖手动设置的真实密钥）"
             fi
-            sudo KUBECONFIG="$KUBECONFIG" kubectl -n solvify-agent apply -f "$RELEASE_DIR/02-configmap.yaml"
-            sudo KUBECONFIG="$KUBECONFIG" kubectl -n solvify-agent apply -f "$RELEASE_DIR/03-postgres.yaml"
-            sudo KUBECONFIG="$KUBECONFIG" kubectl -n solvify-agent apply -f "$RELEASE_DIR/04-redis.yaml"
-            sudo KUBECONFIG="$KUBECONFIG" kubectl -n solvify-agent apply -f "$RELEASE_DIR/05-backend.yaml"
-            sudo KUBECONFIG="$KUBECONFIG" kubectl -n solvify-agent apply -f "$RELEASE_DIR/06-frontend.yaml"
-            sudo KUBECONFIG="$KUBECONFIG" kubectl -n solvify-agent rollout status deployment/backend --timeout=300s
-            sudo KUBECONFIG="$KUBECONFIG" kubectl -n solvify-agent rollout status deployment/frontend --timeout=300s
+            sudo KUBECONFIG="$KUBECONFIG" kubectl -n solvify-agent apply -f /opt/solvify-agent/src/deploy/k3s/02-configmap.yaml
+            sudo KUBECONFIG="$KUBECONFIG" kubectl -n solvify-agent apply -f /opt/solvify-agent/src/deploy/k3s/03-postgres.yaml
+            sudo KUBECONFIG="$KUBECONFIG" kubectl -n solvify-agent apply -f /opt/solvify-agent/src/deploy/k3s/04-redis.yaml
           EOF
+
+      - name: 服务器本地构建并部署 backend/frontend
+        run: |
+          ssh solvify-production "sudo bash /opt/solvify-agent/src/deploy/build-on-server.sh"
 
       - name: 外部健康检查
         env:
